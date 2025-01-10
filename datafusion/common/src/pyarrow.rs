@@ -134,7 +134,9 @@ mod tests {
         });
     }
 
+    // TODO(niebayes): Remove the `allow(unexpected_cfgs)` once pyo3 is updated to version 0.23.0 or higher.
     #[test]
+    #[allow(unexpected_cfgs)]
     fn test_py_scalar() {
         init_python();
 
