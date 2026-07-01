@@ -2526,6 +2526,76 @@ mod test {
         assert_eq!(num_rows, 0);
     }
 
+    #[tokio::test]
+    async fn test_prune_one_constant_columns() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+
+        let batch = record_batch!((
+            "sid",
+            Int32,
+            vec![Some(5), Some(5), Some(5), Some(5), Some(5)]
+        ))
+        .unwrap();
+        let data_size =
+            write_parquet(Arc::clone(&store), "constant.parquet", batch.clone()).await;
+        let schema = batch.schema();
+
+        let file = PartitionedFile::new(
+            "constant.parquet".to_string(),
+            u64::try_from(data_size).unwrap(),
+        )
+        .with_statistics(Arc::new(
+            Statistics::new_unknown(&schema).add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Int32(Some(5))))
+                    .with_max_value(Precision::Exact(ScalarValue::Int32(Some(5))))
+                    .with_null_count(Precision::Exact(0)),
+            ),
+        ));
+
+        let make_opener = |predicate| {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_predicate(predicate)
+                .with_metrics(metrics.clone())
+                .build();
+            (morselizer, metrics)
+        };
+
+        let expr = col("sid").gt(lit(100));
+        let predicate = logical2physical(&expr, &schema);
+        let (opener, metrics) = make_opener(predicate);
+        let stream = open_file(&opener, file).await.unwrap();
+        let (_num_batches, _num_rows) = count_batches_and_rows(stream).await;
+
+        // The bug: `files_ranges_pruned_statistics` pruned count is 0 because
+        // `constant_columns_from_stats` folds the column reference into a literal,
+        // and `FilePruner` cannot prune a constant expression.
+        let pruned = {
+            use datafusion_physical_plan::metrics::MetricValue;
+            metrics
+                .clone_inner()
+                .iter()
+                .filter_map(|m| match m.value() {
+                    MetricValue::PruningMetrics {
+                        name,
+                        pruning_metrics,
+                    } if name.as_ref() == "files_ranges_pruned_statistics" => {
+                        Some(pruning_metrics.pruned())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>()
+        };
+        assert!(
+            pruned > 0,
+            "file with constant column should be pruned at file level, got pruned={pruned}"
+        );
+    }
+
     /// Test that if the filter is not a dynamic filter and we have no stats we don't do extra pruning work at the file level.
     #[tokio::test]
     async fn test_opener_pruning_skipped_on_static_filters() {

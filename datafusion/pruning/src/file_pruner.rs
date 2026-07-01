@@ -169,3 +169,55 @@ impl FilePruner {
         Ok(false)
     }
 }
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::stats::Precision;
+    use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_expr::{col, lit};
+    use datafusion_physical_expr::planner::logical2physical;
+    use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+
+    use super::*;
+
+    /// `FilePruner` with column-reference predicate + constant-column statistics:
+    /// `sid > 100` against statistics where min(sid)=max(sid)=5 with 5 rows.
+    /// The statistics-based pruning path should correctly prune the file.
+    #[test]
+    fn test_prune_with_constant_column_statistics() {
+        // Schema with a single column `sid`.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("sid", DataType::Int32, false)]));
+
+        // Stats with min(sid)=max(sid)=5
+        let stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(5))),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(5))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let file =
+            PartitionedFile::new("test.parquet", 1000).with_statistics(Arc::new(stats));
+
+        // Predicate `sid > 100`.
+        let predicate = logical2physical(&col("sid").gt(lit(100)), &schema);
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let errors = MetricBuilder::new(&metrics_set).global_counter("errors");
+
+        let mut pruner = FilePruner::try_new(predicate, &schema, &file, errors).unwrap();
+        assert!(
+            pruner.should_prune().unwrap(),
+            "sid > 100 with max(sid)=5 should prune via statistics"
+        );
+    }
+}
